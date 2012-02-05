@@ -7,7 +7,7 @@
 -module(gdrl).
 -export([start/2]).
 
--define(MAXSTEPS, 1000).
+-define(MAXSTEPS, 100).
 -define(MAPPINGS, [
     {1, [10,2]},
     {2, [1, 3]},
@@ -37,13 +37,12 @@ start(N, C) ->
 % @doc calculate the fairness measure of the system
 % this uses Jaines Fairness index to look
 % at spare bandwidth at each node
-fairness(N, Limiters) ->
+fairness(Limiters) ->
+    N = length(Limiters),
     Qs = lists:map(
-        fun(A) ->
-            A ! {fairness, self()},
-            receive
-                Q -> Q
-            end
+        fun(Ref) ->
+            [_, Flow, Capacity] = gdrl_limiter:info(Ref),
+            Flow - Capacity
         end,
         Limiters
     ),
@@ -58,12 +57,14 @@ do_step(_, 0) -> ok;
 do_step(Limiters, Step) ->
     lists:map(fun(L) -> gdrl_limiter:adjust(L) end, Limiters),
     io:format("C: ~p~n", [total_capacity(Limiters)]),
+    io:format("System Fairness : ~p~n",[fairness(Limiters)]),
     do_step(Limiters, Step-1).
 
 total_capacity(Limiters) ->
     lists:sum(
         lists:map(fun(L) ->
-            [_, Capacity] = gdrl_limiter:info(L),
+            [Id, Flow, Capacity] = gdrl_limiter:info(L),
+            io:format("[Limiter ~p] ::  F: ~p   C: ~p~n",[Id, Flow, Capacity]),
             Capacity
         end, Limiters)
     ).

@@ -6,6 +6,7 @@
 -export([
     start_link/2,
     link/2,
+    compensate/2,
     info/1,
     adjust/1,
     spare_bandwidth/1
@@ -46,6 +47,9 @@ info(Ref) ->
 adjust(Ref) ->
     gen_server:call(Ref, adjust).
 
+compensate(Ref, Value) ->
+    gen_server:call(Ref, {compensate, Value}).
+
 spare_bandwidth(Ref) ->
     gen_server:call(Ref, spare_bandwidth).
 
@@ -59,15 +63,27 @@ init([Id, Capacity]) ->
     io:format("[Limiter ~p] :: Initialize C: ~p F:~p~n",[Id, Capacity, Flow]),
     {ok, #state{id=Id, capacity=Capacity, flow=Flow}}.
 
-handle_call(info, _From, #state{flow=Flow, capacity=Capacity} = State) ->
-    {reply, [Flow, Capacity], State};
+handle_call({compensate, Value}, _From, #state{capacity=Capacity} = State) ->
+    {reply, ok, State#state{capacity=Capacity+Value}};
+
+handle_call(info, _From, #state{id=Id, flow=Flow, capacity=Capacity} = State) ->
+    {reply, [Id, Flow, Capacity], State};
 
 handle_call(adjust, _From, #state{flow=Flow, capacity=Capacity} = State) ->
     Degree = length(State#state.links),
     SpareBandwidth = Flow - Capacity,
-    RefTotal = lists:map(fun({ok, Q}) -> Q end, [ spare_bandwidth(Ref) || Ref <- State#state.links ]),
-    Delta = lists:sum(lists:map(fun(D) -> (SpareBandwidth - D) end, RefTotal)),
-    NewCap = Capacity + (1/(2*Degree))*Delta,
+
+    Neighbours = lists:map(fun({Ref, {ok, Q}}) -> {Ref, Q} end, [ {Ref, spare_bandwidth(Ref)} || Ref <- State#state.links ]),
+
+    Delta = lists:sum(
+        lists:map(fun({Ref, Q}) ->
+            Cut = (1/(2*Degree))*(SpareBandwidth - Q),
+            gdrl_limiter:compensate(Ref, -1*Cut),
+            Cut
+        end, Neighbours)
+    ),
+
+    NewCap = Capacity + Delta,
     {reply, ok, State#state{capacity=NewCap}};
 
 handle_call(spare_bandwidth, _From, #state{flow=Flow, capacity=Capacity} = State) ->
