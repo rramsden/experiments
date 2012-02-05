@@ -1,0 +1,17 @@
+Distributed Rate Limiting
+=========================
+
+This repository contains a collection of algorithms
+for solving the distributed rate limit problem.
+
+Problem
+=======
+
+Suppose a CDN (Content-Delivery Network) has a cluster of servers which to-
+gether host online content for some customer A. The CDN wants to restrict
+the amount of network bandwidth given to customer A since the customer has
+only paid for a ﬁnite amount; say 5 gigabytes per second. However, due to the
+distributed nature of the CDN’s system incoming requests can arrive randomly
+and can be scheduled to any server in the cluster. To ensure customer A’s
+usage-limit is not exceeded the cluster of nodes must work together and
+adjust the usage-limit across all servers.
