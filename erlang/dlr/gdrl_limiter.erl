@@ -6,10 +6,9 @@
 -export([
     start_link/2,
     link/2,
-    compensate/2,
+    adjust/2,
     info/1,
-    adjust/1,
-    spare_bandwidth/1
+    tick/1
 ]).
 
 %% gen_server callbacks
@@ -23,11 +22,13 @@
 ]).
 
 -define(SERVER, ?MODULE).
+-define(RESPONSIVENESS(D), (1/(2*D))).
+-define(ELSE, true).
 
 -record(state, {
     id :: integer(),
     capacity :: float(),
-    flow :: float(),
+    demand :: float(),
     links = [] :: [pid()]
 }).
 
@@ -44,14 +45,18 @@ link(Ref, Node) ->
 info(Ref) ->
     gen_server:call(Ref, info).
 
-adjust(Ref) ->
-    gen_server:call(Ref, adjust).
+%%%
+% @doc represents a single timestep. During the tick
+% we adjust our fill percentage to match other nodes in cluster
+tick(Ref) ->
+    gen_server:call(Ref, tick).
 
-compensate(Ref, Value) ->
-    gen_server:call(Ref, {compensate, Value}).
-
-spare_bandwidth(Ref) ->
-    gen_server:call(Ref, spare_bandwidth).
+%%%
+% @doc our goal is to get every performance measure equal. In this case
+% were using (Capacity / Demand)
+adjust(Ref, Q1) ->
+    {ok, CapacityToAdd} = gen_server:call(Ref, {adjust, Q1}),
+    CapacityToAdd.
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -59,36 +64,56 @@ spare_bandwidth(Ref) ->
 
 init([Id, Capacity]) ->
     random:seed(now()),
-    Flow = random:uniform(1000),
-    io:format("[Limiter ~p] :: Initialize C: ~p F:~p~n",[Id, Capacity, Flow]),
-    {ok, #state{id=Id, capacity=Capacity, flow=Flow}}.
+    Demand = random:uniform(1000),
+    io:format("[Limiter ~p] :: Initialize C: ~p F:~p~n", [Id, Capacity, Demand]),
+    {ok, #state{id=Id, capacity=Capacity, demand=Demand}}.
 
-handle_call({compensate, Value}, _From, #state{capacity=Capacity} = State) ->
-    {reply, ok, State#state{capacity=Capacity+Value}};
+handle_call(info, _From, #state{id=Id, demand=Demand, capacity=Capacity} = State) ->
+    {reply, [Id, Demand, Capacity], State};
 
-handle_call(info, _From, #state{id=Id, flow=Flow, capacity=Capacity} = State) ->
-    {reply, [Id, Flow, Capacity], State};
+handle_call(tick, _From, #state{demand=Demand, capacity=Capacity, links=Links} = State) ->
+    Q1 = performance(Demand, Capacity),
 
-handle_call(adjust, _From, #state{flow=Flow, capacity=Capacity} = State) ->
-    Degree = length(State#state.links),
-    SpareBandwidth = Flow - Capacity,
+    if Q1 == infinity ->
+        {reply, ok, State};
+    ?ELSE ->
+        % iterate over neighbours, find
+        % one with a fill ratio thats higher
+        NewCap = lists:foldl(
+            fun(Ref, Accum) ->
+                Accum + ?MODULE:adjust(Ref, Q1)
+            end,
+            Capacity,
+            Links
+        ),
+        {reply, ok, State#state{capacity=NewCap}}
+    end;
 
-    Neighbours = lists:map(fun({Ref, {ok, Q}}) -> {Ref, Q} end, [ {Ref, spare_bandwidth(Ref)} || Ref <- State#state.links ]),
+handle_call({adjust, Q1}, _From, #state{demand=Demand, capacity=Capacity, links=Links} = State) ->
+    Q2 = performance(Demand, Capacity),
+    Degree = length(Links),
 
-    Delta = lists:sum(
-        lists:map(fun({Ref, Q}) ->
-            Cut = (1/(2*Degree))*(SpareBandwidth - Q),
-            gdrl_limiter:compensate(Ref, -1*Cut),
-            Cut
-        end, Neighbours)
-    ),
+    Multiplier = case Q2 of
+        infinity ->
+            % demand at this limiter is 0 but it has
+            % capacity, get rid of it ASAP take 100%
+            ?RESPONSIVENESS(Degree) * 1;
+        _ when Q1 < Q2 ->
+            % we take the min(1, X) here because
+            % you can have a limiter with a fill percentage over 100
+            % ie. when demand is higher than capacity
+            ?RESPONSIVENESS(Degree) * (Q2 - Q1);
+        _ ->
+            % the fill ratio C/D at this limiter
+            % is higher than the other
+            0
+    end,
 
-    NewCap = Capacity + Delta,
-    {reply, ok, State#state{capacity=NewCap}};
+    % we need to truncate our floating point number here
+    % otherwise will start getting some pretty big numbers in memory
+    TakeAway = trunc_float(Multiplier * Demand),
 
-handle_call(spare_bandwidth, _From, #state{flow=Flow, capacity=Capacity} = State) ->
-    SpareBandwidth = Flow - Capacity,
-    {reply, {ok, SpareBandwidth}, State};
+    {reply, {ok, TakeAway}, State#state{capacity=Capacity-TakeAway}};
 
 handle_call({link, Node}, _From, #state{links=Links} = State) ->
     io:format("[Limiter ~p] :: Linked with ~p~n", [State#state.id, Node]),
@@ -109,3 +134,15 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+performance(Demand, Capacity) ->
+    case Demand of
+        0 -> infinity;
+        _ -> Capacity / Demand
+    end.
+
+trunc_float(0) -> trunc_float(0.0);
+trunc_float(undefined) -> undefined;
+trunc_float(F) ->
+    [S] = io_lib:format("~.4f",[F]),
+    list_to_float(S).

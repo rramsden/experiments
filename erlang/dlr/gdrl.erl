@@ -1,25 +1,7 @@
-% GDRL (Generalized Distributed Rate Limiting) Algorithm
-%
-% This is a benchmark of the GDRL algorithm discussed in
-% http://fourier.networks.imdea.org/people/~rade_stanojevic/GeneralizedDRL_IWQoS2009.pdf
-%
-% This is a simple token ring, each node has one neighbour
 -module(gdrl).
 -export([start/2]).
 
--define(MAXSTEPS, 100).
--define(MAPPINGS, [
-    {1, [10,2]},
-    {2, [1, 3]},
-    {3, [2, 4]},
-    {4, [3, 5]},
-    {5, [4, 6]},
-    {6, [5, 7]},
-    {7, [6, 8]},
-    {8, [7, 9]},
-    {9, [8, 10]},
-    {10,[9, 1]}
-]).
+-define(MAXSTEPS, 100000).
 
 %% ==============================================================
 %% Public API
@@ -30,8 +12,11 @@
 %      Let C be the aggregate service rate over entire cluster
 start(N, C) ->
     Limiters = lists:map(fun({ok, Pid}) -> Pid end, [ gdrl_limiter:start_link(I, C/N) || I <- lists:seq(1, N) ]),
-    [ build_links(I, Limiters) || I <- lists:seq(1, N) ],
-    do_step(Limiters, ?MAXSTEPS).
+    % keep it simple use a complete graph for now
+    [ add_neighbours(I, Limiters) || I <- lists:seq(1, N) ],
+    total_capacity(Limiters),
+    do_tick(Limiters, ?MAXSTEPS),
+    total_capacity(Limiters).
 
 %%%
 % @doc calculate the fairness measure of the system
@@ -41,8 +26,8 @@ fairness(Limiters) ->
     N = length(Limiters),
     Qs = lists:map(
         fun(Ref) ->
-            [_, Flow, Capacity] = gdrl_limiter:info(Ref),
-            Flow - Capacity
+            [_, Demand, Capacity] = gdrl_limiter:info(Ref),
+            Capacity / Demand
         end,
         Limiters
     ),
@@ -53,27 +38,29 @@ fairness(Limiters) ->
 %% ==============================================================
 %% Private API
 %% ==============================================================
-do_step(_, 0) -> ok;
-do_step(Limiters, Step) ->
-    lists:map(fun(L) -> gdrl_limiter:adjust(L) end, Limiters),
-    io:format("C: ~p~n", [total_capacity(Limiters)]),
-    io:format("System Fairness : ~p~n",[fairness(Limiters)]),
-    do_step(Limiters, Step-1).
+do_tick(_, 0) -> ok;
+do_tick(Limiters, Step) ->
+    lists:map(fun(L) -> gdrl_limiter:tick(L) end, Limiters),
+    io:format("System Fairness : ~p%~n",[trunc_float(fairness(Limiters) * 100)]),
+    do_tick(Limiters, Step-1).
 
 total_capacity(Limiters) ->
     lists:sum(
         lists:map(fun(L) ->
             [Id, Flow, Capacity] = gdrl_limiter:info(L),
-            io:format("[Limiter ~p] ::  F: ~p   C: ~p~n",[Id, Flow, Capacity]),
+            io:format("[Limiter ~p] ::  I: ~p   C: ~p~n",[Id, Flow, Capacity]),
             Capacity
         end, Limiters)
     ).
 
-% this handy function will take an item in a list
-% and add the next ?DEGREE items as neighbours
-build_links(Index, Limiters) when is_list(Limiters) ->
+add_neighbours(Index, Limiters) when is_list(Limiters) ->
     Ref = lists:nth(Index, Limiters),
-    [V1, V2] = proplists:get_value(Index, ?MAPPINGS),
-    gdrl_limiter:link(Ref, lists:nth(V1, Limiters)),
-    gdrl_limiter:link(Ref, lists:nth(V2, Limiters)).
+    Links = Limiters -- [Ref],
+    lists:map(fun(Neighbour) ->
+        gdrl_limiter:link(Ref, Neighbour)
+    end, Links).
 
+trunc_float(undefined) -> undefined;
+trunc_float(F) ->
+    [S] = io_lib:format("~.4f",[F]),
+    list_to_float(S).
