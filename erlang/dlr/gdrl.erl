@@ -1,7 +1,7 @@
 -module(gdrl).
 -export([start/2]).
 
--define(MAXSTEPS, 100000).
+-define(MAXSTEPS, 10).
 
 %% ==============================================================
 %% Public API
@@ -26,8 +26,8 @@ fairness(Limiters) ->
     N = length(Limiters),
     Qs = lists:map(
         fun(Ref) ->
-            [_, Demand, Capacity] = gdrl_limiter:info(Ref),
-            Capacity / Demand
+            [_, Demand, Supply] = gdrl_limiter:info(Ref),
+            Supply / Demand
         end,
         Limiters
     ),
@@ -47,9 +47,9 @@ do_tick(Limiters, Step) ->
 total_capacity(Limiters) ->
     lists:sum(
         lists:map(fun(L) ->
-            [Id, Flow, Capacity] = gdrl_limiter:info(L),
-            io:format("[Limiter ~p] ::  I: ~p   C: ~p~n",[Id, Flow, Capacity]),
-            Capacity
+            [Id, Flow, Supply] = gdrl_limiter:info(L),
+            io:format("[Limiter ~p] ::  Demand: ~p   Supply: ~p~n",[Id, Flow, Supply]),
+            Supply
         end, Limiters)
     ).
 
