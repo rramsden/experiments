@@ -20,7 +20,7 @@
 %%% the input.
 %%% @end
 %%%-------------------------------------------------------------------
--module(sigtree).
+-module(sigmatch).
 -export([new/1, match/2]).
 
 -define(default(X, Y), case X of undefined -> Y; X -> X end).
@@ -298,15 +298,15 @@ small_pattern_test() ->
         "dog",
         "i "
     ],
-    S = sigtree:new(Patterns),
-    ?assertEqual(match, sigtree:match("there is a cat in the bag", S)),
-    ?assertEqual(match, sigtree:match("cow", S)),
-    ?assertEqual(match, sigtree:match(" dog", S)),
-    ?assertEqual(match, sigtree:match("dog ", S)),
-    ?assertEqual(match, sigtree:match(" dog ", S)),
-    ?assertEqual(match, sigtree:match("fat cow", S)),
-    ?assertEqual(match, sigtree:match("foo i bar", S)),
-    ?assertEqual(nomatch, sigtree:match("foobar", S)),
-    ?assertEqual(nomatch, sigtree:match("the lazy foo jumped over the moon", S)).
+    S = sigmatch:new(Patterns),
+    ?assertEqual(match, sigmatch:match("there is a cat in the bag", S)),
+    ?assertEqual(match, sigmatch:match("cow", S)),
+    ?assertEqual(match, sigmatch:match(" dog", S)),
+    ?assertEqual(match, sigmatch:match("dog ", S)),
+    ?assertEqual(match, sigmatch:match(" dog ", S)),
+    ?assertEqual(match, sigmatch:match("fat cow", S)),
+    ?assertEqual(match, sigmatch:match("foo i bar", S)),
+    ?assertEqual(nomatch, sigmatch:match("foobar", S)),
+    ?assertEqual(nomatch, sigmatch:match("the lazy foo jumped over the moon", S)).
 
 -endif.
