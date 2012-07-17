@@ -3,76 +3,176 @@
 %%% @doc
 %%% SIGMATCH is a generic filtering technique that can be plugged in
 %%% as a pre-processing step for any existing multi-pattern matching
-%%% system.
+%%% system. The sigmatch filter sits in front of an existing multi-pattern
+%%% matching system as seen below:
+%%%
+%%%             +--------------+               +---------------+
+%%%      Text   |              |     maybe     |               |
+%%%  +--------->|   SigMatch   |+------------->|    External   |
+%%%             |              |+-------+      |   Validation  |
+%%%             +--------------+        |      |               |
+%%%                    +                |      +---------------+
+%%%                    | nomatch        | match    | match | nomatch
+%%%                    |                |          |       |
+%%%                    v                v          v       v
+%%%
+%%% Sigmatch returns either maybe, match, or nomatch depending on
+%%% the input.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(sigtree).
 -export([new/1, match/2]).
 
--define(ALPHABET, 256).
--define(TABLE_SIZE, (?ALPHABET * ?ALPHABET)).
+-define(default(X, Y), case X of undefined -> Y; X -> X end).
+
+% leaf nodes sit at the bottom of the truncated
+% trie described in the SigMatch whitepaper. They
+% will either contain a bloomfilter or a list of possible
+% matches or both.
+-record(leaf_node, {
+    bloom,
+    matches = []
+}).
 
 % tuning parameters for sigtree
 -define(B, 2).
 -define(BETA, 4).
--define(BGRAM, ?B + ?BETA).
 
+% misc
+-define(ALPHABET, 256).
+-define(TABLE_SIZE, (?ALPHABET * ?ALPHABET)).
+-define(BGRAM_SIZE, ?B + ?BETA).
+
+%%%
+%% @doc
+%% new/1
+%%
+%% Given a list of signatures this function will generate
+%% a sigtree
+%% @end
 new(Signatures) ->
     TabId = ets:new(sigtree, [ordered_set, {read_concurrency, true}]),
     Cover = cover(Signatures),
     build_index(TabId, Signatures, Cover),
     {sigtree, TabId}.
 
+%%%
+%% @doc
+%% match/2
+%%
+%% Since were trying to match patterns against a text string
+%% we need to walk the text character by characters until we hit
+%% a match in our ETS ordered set.
+%% @end
 match(String, {sigtree, TabId}) ->
     walk_text(TabId, String).
 
 walk_text(_, Str) when length(Str) =< ?B ->
     nomatch;
 walk_text(TabId, [_|T] = String) ->
-    [Chars, Rest] = first(?B, String),
+    [Chars, Rest] = split(String, ?B, ?BETA),
     TrieIndex = list_to_int(Chars),
+
+    io:format("~p ~p~n", [Chars, Rest]),
     
     case ets:lookup(TabId, TrieIndex) of
-        [{TrieIndex, Bloom}] ->
-            case bloom:is_element(Rest, Bloom) of
+        [{TrieIndex, Leaf}] ->
+            io:format("~p is in leaf~n", [Chars]),
+            io:format("Rest is ~p~n", [Rest]),
+            case is_in_leaf(Leaf, Rest) of
                 true ->
-                    true;
+                    match;
                 false ->
                     walk_text(TabId, T)
             end;
         [] ->
             walk_text(TabId, T)
     end.
+
+is_in_leaf(#leaf_node{matches=Matches} = Leaf, String) ->
+    io:format("Matches = ~p~n", [Matches]),
+    case lists:any(fun(SubStr) -> is_prefix(SubStr, String) end, Matches) of
+        true ->
+            true;
+        false ->
+            check_bloom(Leaf, String)
+    end.
+
+is_prefix([], _) ->
+    true; % the index is a pattern 
+is_prefix(SubStr, String) ->
+    string:str(String, SubStr) == 1.
+
+check_bloom(#leaf_node{bloom=Bloom}, SubStr) ->
+    case Bloom of
+        undefined ->
+            false;
+        Bloom ->
+            bloom:is_element(SubStr, Bloom)
+    end.
     
 build_index(_, [], _) ->
     ok;
 build_index(TabId, [Sig|T], Cover) ->
-    walk_bgrams(TabId, Sig, Cover),
+    case walk_bgrams(TabId, Sig, Cover) of
+        match ->
+            ok;
+        nomatch ->
+            add_index(TabId, Sig)
+    end,
     build_index(TabId, T, Cover).
 
 walk_bgrams(_, _, []) ->
-    ok;
+    nomatch;
 walk_bgrams(TabId, Sig, [BGram | T]) ->
     case representative_substring(list_to_binary(Sig), BGram) of
         {match, Substring} ->
-            add_index(TabId, Sig, Substring);
+            add_index(TabId, binary_to_list(Substring)),
+            match;
         nomatch ->
             walk_bgrams(TabId, Sig, T)
     end.
 
-add_index(TabId, _Sig, Substring) ->
-    [Chars, Rest] = first(?B, binary_to_list(Substring)),
+%%%
+%% @private
+%% @doc
+%% We construct the Trie mentioned in the SigMatch whitepaper
+%% by using an ordered ETS Table. The first ?B characters are 
+%% stored as an index into the ETS table while the following ?BETA
+%% characters are hashed into a bloom filter or appended to a linked list.
+%% If the signature is shorter than ?B + ?BETA characters we store possible
+%% matches in a linked list.
+%% @end
+add_index(TabId, Substring) ->
+    [Chars, Rest] = split(Substring, ?B, ?BETA),
+
     Index = list_to_int(Chars),
 
     case ets:lookup(TabId, Index) of
         [] ->
-            B = bloom:bloom(4000),
-            bloom:add_element(Rest, B),
-            ets:insert(TabId, {Index, B});
-        [{Index, B1}] ->
-            B2 = bloom:add_element(Rest, B1),
-            ets:insert(TabId, {Index, B2})
+            ets_insert(TabId, #leaf_node{}, Index, Rest);
+        [{Index, Leaf}] ->
+            ets_insert(TabId, Leaf, Index, Rest)
     end.
+
+split(Str, _, _) when length(Str) =< ?B ->
+    [Str, []];
+split(Str, Start, End) ->
+    P1 = string:substr(Str, 1, Start),
+    P2 = string:substr(Str, Start + 1, Start + End),
+    [P1, P2].
+
+ets_insert(TabId, Leaf0, Index, SubStr) when length(SubStr) < ?BETA ->
+    Matches0 = Leaf0#leaf_node.matches,
+    Matches1 = [SubStr|Matches0],
+    Leaf1 = Leaf0#leaf_node{matches=Matches1},
+    ets:insert(TabId, {Index, Leaf1});
+ets_insert(TabId, Leaf0, Index, SubStr) ->
+    X = Leaf0#leaf_node.bloom,
+    B1 = ?default(X, bloom:bloom(4000)),
+    B2 = bloom:add_element(SubStr, B1),
+    Leaf1 = Leaf0#leaf_node{bloom=B2},
+    ets:insert(TabId, {Index, Leaf1}).
 
 %%%
 %% @private
@@ -173,22 +273,45 @@ build(Pos, TabId, [Sig | Rest]) ->
     left_to_right_pass(Pos, Sig, TabId),
     build(Pos + 1, TabId, Rest).
 
-left_to_right_pass(_Pos, Str, _TabId) when length(Str) < ?BGRAM ->
+left_to_right_pass(_Pos, Str, _TabId) when length(Str) < ?BGRAM_SIZE ->
     ok;
-left_to_right_pass(Pos, Str, TabId) ->
-    [Chars, Rest] = first(?B, Str),
+left_to_right_pass(Pos, [_|T] = Str, TabId) ->
+    [Chars, _] = split(Str, ?B, ?BETA),
     Index = list_to_int(Chars),
     ets:update_counter(TabId, Index, 1),
-    left_to_right_pass(Pos, Rest, TabId).
-
-first(N, List) ->
-    first(N, List, []).
-first(0, Tail, Acc) ->
-    [Acc, Tail];
-first(Count, [H|T], Acc) ->
-    first(Count - 1, T, Acc ++ [H]).
+    left_to_right_pass(Pos, T, TabId).
 
 list_to_int(List) ->
     binary:decode_unsigned(list_to_binary(List)).
 int_to_bin(Bin) ->
     binary:encode_unsigned(Bin).
+
+-ifndef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% small patterns which are less than the size
+%% of the representative substring are handled using
+%% linked list lookups instead of bloom filters
+small_pattern_test() ->
+    % NOTE: we can't have patterns less than a ?B
+    % characters since we don't use a trie. We index
+    % possible matches by taking ?B characters from a string
+    % and storing it as an index into an ETS table
+    Patterns = [
+        "cat",
+        "cow",
+        "dog",
+        "i "
+    ],
+    S = sigtree:new(Patterns),
+    ?assertEqual(match, sigtree:match("there is a cat in the bag", S)),
+    ?assertEqual(match, sigtree:match("cow", S)),
+    ?assertEqual(match, sigtree:match(" dog", S)),
+    ?assertEqual(match, sigtree:match("dog ", S)),
+    ?assertEqual(match, sigtree:match(" dog ", S)),
+    ?assertEqual(match, sigtree:match("fat cow", S)),
+    ?assertEqual(match, sigtree:match("foo i bar", S)),
+    ?assertEqual(nomatch, sigtree:match("foobar", S)),
+    ?assertEqual(nomatch, sigtree:match("the lazy foo jumped over the moon", S)).
+
+-endif.
