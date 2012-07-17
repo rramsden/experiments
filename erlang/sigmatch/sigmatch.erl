@@ -73,12 +73,8 @@ walk_text(TabId, [_|T] = String) ->
     [Chars, Rest] = split(String, ?B, ?BETA),
     TrieIndex = list_to_int(Chars),
 
-    io:format("~p ~p~n", [Chars, Rest]),
-    
     case ets:lookup(TabId, TrieIndex) of
         [{TrieIndex, Leaf}] ->
-            io:format("~p is in leaf~n", [Chars]),
-            io:format("Rest is ~p~n", [Rest]),
             case is_in_leaf(Leaf, Rest) of
                 true ->
                     match;
@@ -90,7 +86,6 @@ walk_text(TabId, [_|T] = String) ->
     end.
 
 is_in_leaf(#leaf_node{matches=Matches} = Leaf, String) ->
-    io:format("Matches = ~p~n", [Matches]),
     case lists:any(fun(SubStr) -> is_prefix(SubStr, String) end, Matches) of
         true ->
             true;
