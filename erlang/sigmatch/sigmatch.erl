@@ -8,10 +8,10 @@
 %%%
 %%%             +--------------+               +---------------+
 %%%      Text   |              |     maybe     |               |
-%%%  +--------->|   SigMatch   |+------------->|    External   |
-%%%             |              |+-------+      |   Validation  |
-%%%             +--------------+        |      |               |
-%%%                    +                |      +---------------+
+%%%  +--------->|   SigMatch   |+------------->|    ETS Dict   |
+%%%             |              |+-------+      |               |
+%%%             +--------------+        |      +---------------+
+%%%                    +                |          |       |    
 %%%                    | nomatch        | match    | match | nomatch
 %%%                    |                |          |       |
 %%%                    v                v          v       v
@@ -23,15 +23,18 @@
 -module(sigmatch).
 -export([new/1, match/2]).
 
--define(default(X, Y), case X of undefined -> Y; X -> X end).
-
 % leaf nodes sit at the bottom of the truncated
 % trie described in the SigMatch whitepaper. They
 % will either contain a bloomfilter or a list of possible
 % matches or both.
 -record(leaf_node, {
-    bloom,
+    bloom = bloom:sbf(30000),
     matches = []
+}).
+
+-record(tables, {
+    sigtree,
+    dict
 }).
 
 % tuning parameters for sigtree
@@ -51,10 +54,12 @@
 %% a sigtree
 %% @end
 new(Signatures) ->
-    TabId = ets:new(sigtree, [ordered_set, {read_concurrency, true}]),
+    A = ets:new(sigtree, [ordered_set, {read_concurrency, true}]),
+    B = ets:new(sigmatch_dict, [set]),
+    Tables = #tables{sigtree=A, dict=B},
     Cover = cover(Signatures),
-    build_index(TabId, Signatures, Cover),
-    {sigtree, TabId}.
+    build_index(Tables, Signatures, Cover),
+    {sigtree, Tables}.
 
 %%%
 %% @doc
@@ -64,68 +69,74 @@ new(Signatures) ->
 %% we need to walk the text character by characters until we hit
 %% a match in our ETS ordered set.
 %% @end
-match(String, {sigtree, TabId}) ->
-    walk_text(TabId, String).
+match(String, {sigtree, Tables}) ->
+    walk_text(Tables, String, String).
 
-walk_text(_, Str) when length(Str) =< ?B ->
+walk_text(_, _, Substr) when length(Substr) =< ?B ->
     nomatch;
-walk_text(TabId, [_|T] = String) ->
-    [Chars, Rest] = split(String, ?B, ?BETA),
+walk_text(#tables{sigtree=TabId, dict=DictId} = Tables, Sig, [_|T] = Substr) ->
+    [Chars, Beta] = split(Substr, ?B, ?BETA),
     TrieIndex = list_to_int(Chars),
+    DictIndex = string:substr(Substr, 1, ?B + ?BETA),
 
     case ets:lookup(TabId, TrieIndex) of
         [{TrieIndex, Leaf}] ->
-            case is_in_leaf(Leaf, Rest) of
+            case in_leaf(DictId, DictIndex, Leaf, Sig, Beta) of
                 true ->
                     match;
                 false ->
-                    walk_text(TabId, T)
+                    walk_text(Tables, Sig, T)
             end;
         [] ->
-            walk_text(TabId, T)
+            walk_text(Tables, Sig, T)
     end.
 
-is_in_leaf(#leaf_node{matches=Matches} = Leaf, String) ->
-    case lists:any(fun(SubStr) -> is_prefix(SubStr, String) end, Matches) of
-        true ->
-            true;
-        false ->
-            check_bloom(Leaf, String)
+in_leaf(DictId, DictIndex, Leaf, Sig, Beta) ->
+    Matches = Leaf#leaf_node.matches,
+    Bloomfilter = Leaf#leaf_node.bloom,
+    InMatches = lists:any(fun(SubStr) -> 
+        is_prefix(SubStr, Beta) 
+    end, Matches),
+    InBloom = bloom:is_element(Beta, Bloomfilter),
+    InMatches orelse (InBloom andalso dict_match(DictId, DictIndex, Sig)).
+
+dict_match(DictId, DictIndex, Sig) ->
+    case ets:lookup(DictId, DictIndex) of
+        [] ->
+            false;
+        [{DictIndex, Matches}] ->
+            lists:any(
+                fun(Pattern) -> 
+                    re:run(Sig, Pattern) =/= nomatch
+                end, Matches
+            )
     end.
 
 is_prefix([], _) ->
     true; % the index is a pattern 
-is_prefix(SubStr, String) ->
-    string:str(String, SubStr) == 1.
+is_prefix(SubStr, RS) ->
+    string:str(RS, SubStr) == 1.
 
-check_bloom(#leaf_node{bloom=Bloom}, SubStr) ->
-    case Bloom of
-        undefined ->
-            false;
-        Bloom ->
-            bloom:is_element(SubStr, Bloom)
-    end.
-    
 build_index(_, [], _) ->
     ok;
-build_index(TabId, [Sig|T], Cover) ->
-    case walk_bgrams(TabId, Sig, Cover) of
+build_index(Tables, [Sig|T], Cover) ->
+    case walk_bgrams(Tables, Sig, Cover) of
         match ->
             ok;
         nomatch ->
-            add_index(TabId, Sig)
+            add_index(Tables, Sig, Sig)
     end,
-    build_index(TabId, T, Cover).
+    build_index(Tables, T, Cover).
 
 walk_bgrams(_, _, []) ->
     nomatch;
-walk_bgrams(TabId, Sig, [BGram | T]) ->
+walk_bgrams(Tables, Sig, [BGram | T]) ->
     case representative_substring(list_to_binary(Sig), BGram) of
         {match, Substring} ->
-            add_index(TabId, binary_to_list(Substring)),
+            add_index(Tables, Sig, binary_to_list(Substring)),
             match;
         nomatch ->
-            walk_bgrams(TabId, Sig, T)
+            walk_bgrams(Tables, Sig, T)
     end.
 
 %%%
@@ -138,7 +149,21 @@ walk_bgrams(TabId, Sig, [BGram | T]) ->
 %% If the signature is shorter than ?B + ?BETA characters we store possible
 %% matches in a linked list.
 %% @end
-add_index(TabId, Substring) ->
+add_index(Tables, Signature, Substring) ->
+    add_sigtree_index(Tables#tables.sigtree, Substring),
+    add_dict_index(Tables#tables.dict, Signature, Substring).
+
+add_dict_index(TabId, Sig, Substring) ->
+    Index = string:substr(Substring, 1, ?B + ?BETA),
+
+    case ets:lookup(TabId, Index) of
+        [] ->
+            ets:insert(TabId, {Index, [Sig]});
+        [{Index, Matches}] ->
+            ets:insert(TabId, {Index, [Sig|Matches]})
+    end.
+
+add_sigtree_index(TabId, Substring) ->
     [Chars, Rest] = split(Substring, ?B, ?BETA),
 
     Index = list_to_int(Chars),
@@ -154,7 +179,7 @@ split(Str, _, _) when length(Str) =< ?B ->
     [Str, []];
 split(Str, Start, End) ->
     P1 = string:substr(Str, 1, Start),
-    P2 = string:substr(Str, Start + 1, Start + End),
+    P2 = string:substr(Str, Start + 1, End),
     [P1, P2].
 
 ets_insert(TabId, Leaf0, Index, SubStr) when length(SubStr) < ?BETA ->
@@ -163,8 +188,7 @@ ets_insert(TabId, Leaf0, Index, SubStr) when length(SubStr) < ?BETA ->
     Leaf1 = Leaf0#leaf_node{matches=Matches1},
     ets:insert(TabId, {Index, Leaf1});
 ets_insert(TabId, Leaf0, Index, SubStr) ->
-    X = Leaf0#leaf_node.bloom,
-    B1 = ?default(X, bloom:bloom(4000)),
+    B1 = Leaf0#leaf_node.bloom,
     B2 = bloom:add_element(SubStr, B1),
     Leaf1 = Leaf0#leaf_node{bloom=B2},
     ets:insert(TabId, {Index, Leaf1}).
@@ -293,10 +317,11 @@ small_pattern_test() ->
     % possible matches by taking ?B characters from a string
     % and storing it as an index into an ETS table
     Patterns = [
-        "cat",
+       "cat",
         "cow",
         "dog",
-        "i "
+        "i ",
+        "xl van"
     ],
     S = sigmatch:new(Patterns),
     ?assertEqual(match, sigmatch:match("there is a cat in the bag", S)),
@@ -306,7 +331,24 @@ small_pattern_test() ->
     ?assertEqual(match, sigmatch:match(" dog ", S)),
     ?assertEqual(match, sigmatch:match("fat cow", S)),
     ?assertEqual(match, sigmatch:match("foo i bar", S)),
+    ?assertEqual(match, sigmatch:match("xl vanz", S)),
     ?assertEqual(nomatch, sigmatch:match("foobar", S)),
     ?assertEqual(nomatch, sigmatch:match("the lazy foo jumped over the moon", S)).
+
+%% Bigger patterns will use bloom filters to check
+%% for existence.
+big_pattern_test() ->
+    Patterns = [
+        "will this big pattern match :D",
+        "will this big pattern match ;D",
+        "will this big pattern match :O"
+    ],
+    S = sigmatch:new(Patterns),
+
+    % This will match because we look at ?B characters as the index
+    % into our ETS then the following ?BETA characters are hashed into
+    % a bloom filter checking for existence.
+    ?assertEqual(match, sigmatch:match("will this big pattern match ;D", S)),
+    ?assertEqual(nomatch, sigmatch:match("will this big pattern match ;X", S)).
 
 -endif.
