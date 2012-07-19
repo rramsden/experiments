@@ -1,4 +1,11 @@
 SigMatch
 --------
 
-SigMatch is an algorithm for fast scalable multi-pattern matching.
+Want to match a few billion patterns against a text-string. No Problem! 
+SigMatch is an algorithm for fast scalable multi-pattern matching. It uses
+bloomfilters to determine if a text-string possibly matches a pattern or determines
+its not in the set. If it detects that a text string may match a pattern we store a list of
+possible matches inside ETS for quick run-time checking.
+
+You can find the original whitepaper here
+pages.cs.wisc.edu/~jignesh/publ/sigmatch.pdf
