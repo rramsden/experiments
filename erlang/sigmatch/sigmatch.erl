@@ -28,7 +28,7 @@
 % will either contain a bloomfilter or a list of possible
 % matches or both.
 -record(leaf_node, {
-    bloom = bloom:sbf(30000),
+    bloom,
     matches = []
 }).
 
@@ -38,13 +38,13 @@
 }).
 
 % tuning parameters for sigtree
--define(B, 2).
--define(BETA, 4).
+-define(B, 2). % # of characters for trie index
+-define(BETA, 4). % # of characters to hash into bloomfilter
 
 % misc
 -define(ALPHABET, 256).
--define(TABLE_SIZE, (?ALPHABET * ?ALPHABET)).
--define(BGRAM_SIZE, ?B + ?BETA).
+-define(BGRAM_TABLE_SIZE, (?ALPHABET * ?ALPHABET)).
+-define(default(X, Fun), case X of undefined -> Fun(); X -> X end).
 
 %%%
 %% @doc
@@ -94,10 +94,11 @@ walk_text(#tables{sigtree=TabId, dict=DictId} = Tables, Sig, [_|T] = Substr) ->
 in_leaf(DictId, DictIndex, Leaf, Sig, Beta) ->
     Matches = Leaf#leaf_node.matches,
     Bloomfilter = Leaf#leaf_node.bloom,
-    InMatches = lists:any(fun(SubStr) -> 
-        is_prefix(SubStr, Beta) 
-    end, Matches),
-    InBloom = bloom:is_element(Beta, Bloomfilter),
+    InMatches = lists:any(fun(SubStr) -> is_prefix(SubStr, Beta) end, Matches),
+    InBloom = case Bloomfilter of
+        undefined -> false;
+        _ -> bloom:is_element(Beta, Bloomfilter)
+    end,
     InMatches orelse (InBloom andalso dict_match(DictId, DictIndex, Sig)).
 
 dict_match(DictId, DictIndex, Sig) ->
@@ -113,7 +114,7 @@ dict_match(DictId, DictIndex, Sig) ->
     end.
 
 is_prefix([], _) ->
-    true; % the index is a pattern 
+    true; % empty array means the trie index is a match
 is_prefix(SubStr, RS) ->
     string:str(RS, SubStr) == 1.
 
@@ -121,20 +122,17 @@ build_index(_, [], _) ->
     ok;
 build_index(Tables, [Sig|T], Cover) ->
     case walk_bgrams(Tables, Sig, Cover) of
-        match ->
-            ok;
-        nomatch ->
-            add_index(Tables, Sig, Sig)
+        {match, Substring} -> add_index(Tables, Sig, binary_to_list(Substring));
+        nomatch -> add_index(Tables, Sig, Sig)
     end,
-    build_index(Tables, T, Cover).
+    build_index(Tables, T, Cover). 
 
 walk_bgrams(_, _, []) ->
     nomatch;
 walk_bgrams(Tables, Sig, [BGram | T]) ->
     case representative_substring(list_to_binary(Sig), BGram) of
         {match, Substring} ->
-            add_index(Tables, Sig, binary_to_list(Substring)),
-            match;
+            {match, Substring};
         nomatch ->
             walk_bgrams(Tables, Sig, T)
     end.
@@ -165,7 +163,6 @@ add_dict_index(TabId, Sig, Substring) ->
 
 add_sigtree_index(TabId, Substring) ->
     [Chars, Rest] = split(Substring, ?B, ?BETA),
-
     Index = list_to_int(Chars),
 
     case ets:lookup(TabId, Index) of
@@ -188,7 +185,8 @@ ets_insert(TabId, Leaf0, Index, SubStr) when length(SubStr) < ?BETA ->
     Leaf1 = Leaf0#leaf_node{matches=Matches1},
     ets:insert(TabId, {Index, Leaf1});
 ets_insert(TabId, Leaf0, Index, SubStr) ->
-    B1 = Leaf0#leaf_node.bloom,
+    Bloomfilter = Leaf0#leaf_node.bloom,
+    B1 = ?default(Bloomfilter, fun() -> bloom:sbf(26700) end),
     B2 = bloom:add_element(SubStr, B1),
     Leaf1 = Leaf0#leaf_node{bloom=B2},
     ets:insert(TabId, {Index, Leaf1}).
@@ -209,10 +207,11 @@ cover(Signatures0, Acc) ->
     cover_cleanup(TabId),
 
     case BGram of
-        <<1>> ->
+        undefined ->
             Acc;
         _ ->
-            cover(prune(Signatures0, BGram), [BGram| Acc])
+            Pruned = prune(Signatures0, BGram),
+            cover(Pruned, [BGram| Acc])
     end.
 
 cover_setup() ->
@@ -270,7 +269,7 @@ representative_substring(String, BGram) ->
 %% in build/2 and extract the b-gram which has the highest frequency
 %% @end
 highest_occurrence(TabId) ->
-    {BGram, _} = lists:foldl(
+    {BGram, Size} = lists:foldl(
         fun({Index, Size}, {IndexOld, Max}) ->
                 case Size > Max of
                     true ->
@@ -282,7 +281,10 @@ highest_occurrence(TabId) ->
         {-1, -1},
         ets:tab2list(TabId)
     ),
-    int_to_bin(BGram).
+    case Size of
+        0 -> undefined;
+        _ -> int_to_bin(BGram)
+    end.
 
 build(TabId, Signatures) ->
     build(1, TabId, Signatures).
@@ -292,7 +294,7 @@ build(Pos, TabId, [Sig | Rest]) ->
     left_to_right_pass(Pos, Sig, TabId),
     build(Pos + 1, TabId, Rest).
 
-left_to_right_pass(_Pos, Str, _TabId) when length(Str) < ?BGRAM_SIZE ->
+left_to_right_pass(_Pos, Str, _TabId) when length(Str) < (?B + ?BETA) ->
     ok;
 left_to_right_pass(Pos, [_|T] = Str, TabId) ->
     [Chars, _] = split(Str, ?B, ?BETA),
@@ -317,7 +319,7 @@ small_pattern_test() ->
     % possible matches by taking ?B characters from a string
     % and storing it as an index into an ETS table
     Patterns = [
-       "cat",
+        "cat",
         "cow",
         "dog",
         "i ",
