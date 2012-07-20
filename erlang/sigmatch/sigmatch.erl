@@ -56,12 +56,12 @@
 %% Generates a sigtree for a list of patterns
 %% @end
 new(Signatures) ->
-    A = ets:new(sigmatch_trie, [set]),
-    B = ets:new(sigmatch_dict, [set]),
-    Tables = #tables{trie=A, dict=B},
+    Trie = dict:new(),
+    Dict = dict:new(),
+    Tables0 = #tables{trie=Trie, dict=Dict},
     Cover = lists:reverse(cover(Signatures)),
-    build_index(Tables, Signatures, Cover),
-    {sigtree, Tables}.
+    Tables1 = build_index(Tables0, Signatures, Cover),
+    {sigtree, Tables1}.
 
 %%%
 %% @doc
@@ -75,50 +75,50 @@ match(Text, {sigtree, Tables}) ->
     walk_text(Tables, Text, Text).
 
 walk_text(_, _, Substr) when length(Substr) =< ?B -> nomatch;
-walk_text(#tables{trie=TrieId, dict=DictId} = Tables, Text, [_|T] = Substr) ->
+walk_text(#tables{trie=Trie, dict=Dict} = Tables, Text, [_|T] = Substr) ->
     [B, Beta] = split(Substr, ?B, ?BETA),
     TrieIndex = B,
     DictIndex = string:substr(Substr, 1, ?B + ?BETA),
 
-    case ets:lookup(TrieId, TrieIndex) of
-        [{TrieIndex, Leaf}] ->
-            case check_leaf(DictId, DictIndex, Leaf, Text, Beta) of
+    case dict:find(TrieIndex, Trie) of
+        {ok, Leaf} ->
+            case check_leaf(Dict, DictIndex, Leaf, Text, Beta) of
                 true -> match;
                 false -> walk_text(Tables, Text, T)
             end;
-        [] ->
+        error ->
             walk_text(Tables, Text, T)
     end.
 
-check_leaf(DictId, DictIndex, Leaf, Text, Beta) ->
+check_leaf(Dict, DictIndex, Leaf, Text, Beta) ->
     Matches = Leaf#leaf_node.matches,
     BF = Leaf#leaf_node.bloom,
     InMatches = lists:any(fun ([]) -> true; % the index matched the string
                               (SubStr) -> is_prefix(SubStr, Beta)
                           end, Matches),
-    InMatches orelse (in_bloom(Beta, BF) andalso in_dict(DictId, DictIndex, Text)).
+    InMatches orelse (in_bloom(Beta, BF) andalso in_dict(Dict, DictIndex, Text)).
 
 in_bloom(_, undefined) -> false;
 in_bloom(E, BF) -> bloom:is_element(E, BF).
 
-in_dict(DictId, DictIndex, Text) ->
-    case ets:lookup(DictId, DictIndex) of
-        [] ->
+in_dict(Dict, DictIndex, Text) ->
+    case dict:find(DictIndex, Dict) of
+        error ->
             false;
-        [{DictIndex, Matches}] ->
+        {ok, Matches} ->
             lists:any(fun(Pattern) -> re:run(Text, Pattern) =/= nomatch end, Matches)
     end.
 
 is_prefix(SubStr, RS) ->
     string:str(RS, SubStr) == 1.
 
-build_index(_, [], _) -> ok;
-build_index(Tables, [Sig|T], Cover) ->
-    case walk_bgrams(Tables, Sig, Cover) of
-        {match, Substring} -> add_index(Tables, Sig, ?b2l(Substring));
-        nomatch -> add_index(Tables, Sig, Sig)
+build_index(Tables, [], _) -> Tables;
+build_index(Tables0, [Sig|T], Cover) ->
+    Tables1 = case walk_bgrams(Tables0, Sig, Cover) of
+        {match, Substring} -> add_index(Tables0, Sig, ?b2l(Substring));
+        nomatch -> add_index(Tables0, Sig, Sig)
     end,
-    build_index(Tables, T, Cover). 
+    build_index(Tables1, T, Cover). 
 
 walk_bgrams(_, _, []) -> nomatch;
 walk_bgrams(Tables, Sig, [BGram | T]) ->
@@ -139,28 +139,29 @@ walk_bgrams(Tables, Sig, [BGram | T]) ->
 %% If the signature is shorter than ?B + ?BETA characters we store possible
 %% matches in a linked list.
 %% @end
-add_index(Tables, Signature, Substring) ->
-    add_trie_index(Tables#tables.trie, Substring),
-    add_dict_index(Tables#tables.dict, Signature, Substring).
+add_index(#tables{trie=Trie0, dict=Dict0}, Signature, Substring) ->
+    Trie1 = add_trie_index(Trie0, Substring),
+    Dict1 = add_dict_index(Dict0, Signature, Substring),
+    #tables{trie=Trie1, dict=Dict1}.
 
-add_dict_index(TabId, Sig, Substring) ->
+add_dict_index(Dict, Sig, Substring) ->
     Index = string:substr(Substring, 1, ?B + ?BETA),
 
-    case ets:lookup(TabId, Index) of
-        [] ->
-            ets:insert(TabId, {Index, [Sig]});
-        [{Index, Matches}] ->
-            ets:insert(TabId, {Index, [Sig|Matches]})
+    case dict:find(Index, Dict) of
+        error ->
+            dict:store(Index, [Sig], Dict);
+        {ok, Matches} ->
+            dict:store(Index, [Sig|Matches], Dict)
     end.
 
-add_trie_index(TabId, Substring) ->
+add_trie_index(Trie, Substring) ->
     [TrieIndex, Rest] = split(Substring, ?B, ?BETA),
 
-    case ets:lookup(TabId, TrieIndex) of
-        [] ->
-            ets_insert(TabId, #leaf_node{}, TrieIndex, Rest);
-        [{Index, Leaf}] ->
-            ets_insert(TabId, Leaf, Index, Rest)
+    case dict:find(TrieIndex, Trie) of
+        error ->
+            dict_insert(Trie, #leaf_node{}, TrieIndex, Rest);
+        {ok, Leaf} ->
+            dict_insert(Trie, Leaf, TrieIndex, Rest)
     end.
 
 split(Str, _, _) when length(Str) =< ?B ->
@@ -170,17 +171,17 @@ split(Str, Start, End) ->
     P2 = string:substr(Str, Start + 1, End),
     [P1, P2].
 
-ets_insert(TabId, Leaf0, Index, SubStr) when length(SubStr) < ?BETA ->
+dict_insert(Trie, Leaf0, Index, SubStr) when length(SubStr) < ?BETA ->
     Matches0 = Leaf0#leaf_node.matches,
     Matches1 = [SubStr|Matches0],
     Leaf1 = Leaf0#leaf_node{matches=Matches1},
-    ets:insert(TabId, {Index, Leaf1});
-ets_insert(TabId, Leaf0, Index, SubStr) ->
+    dict:store(Index, Leaf1, Trie);
+dict_insert(Trie, Leaf0, Index, SubStr) ->
     Bloomfilter = Leaf0#leaf_node.bloom,
     B1 = ?default(Bloomfilter, fun() -> bloom:sbf(26700) end),
     B2 = bloom:add_element(SubStr, B1),
     Leaf1 = Leaf0#leaf_node{bloom=B2},
-    ets:insert(TabId, {Index, Leaf1}).
+    dict:store(Index, Leaf1, Trie).
 
 %%%
 %% @private
