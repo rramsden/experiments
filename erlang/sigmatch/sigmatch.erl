@@ -54,7 +54,7 @@
 %% a sigtree
 %% @end
 new(Signatures) ->
-    A = ets:new(sigtree, [ordered_set, {read_concurrency, true}]),
+    A = ets:new(sigmatch_tree, [set]),
     B = ets:new(sigmatch_dict, [set]),
     Tables = #tables{sigtree=A, dict=B},
     Cover = cover(Signatures),
@@ -216,8 +216,8 @@ cover(Signatures0, Acc) ->
     end.
 
 cover_setup() ->
-    TabId = ets:new(frequency_table, [ordered_set, public]),
-    [ets:insert(TabId, {I, 0}) || I <- lists:seq(1, ?TABLE_SIZE)],
+    TabId = ets:new(frequency_table, [set]),
+    [ets:insert(TabId, {I, 0}) || I <- lists:seq(1, ?BGRAM_TABLE_SIZE)],
     TabId.
 cover_cleanup(TabId) ->
     true = ets:delete(TabId).
