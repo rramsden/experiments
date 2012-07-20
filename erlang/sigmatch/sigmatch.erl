@@ -23,6 +23,9 @@
 -module(sigmatch).
 -export([new/1, match/2]).
 
+-define(l2b(X), list_to_binary(X)).
+-define(b2l(X), binary_to_list(X)).
+
 % leaf nodes sit at the bottom of the truncated
 % trie described in the SigMatch whitepaper. They
 % will either contain a bloomfilter or a list of possible
@@ -33,7 +36,7 @@
 }).
 
 -record(tables, {
-    sigtree,
+    trie,
     dict
 }).
 
@@ -50,14 +53,13 @@
 %% @doc
 %% new/1
 %%
-%% Given a list of signatures this function will generate
-%% a sigtree
+%% Generates a sigtree for a list of patterns
 %% @end
 new(Signatures) ->
-    A = ets:new(sigmatch_tree, [set]),
+    A = ets:new(sigmatch_trie, [set]),
     B = ets:new(sigmatch_dict, [set]),
-    Tables = #tables{sigtree=A, dict=B},
-    Cover = cover(Signatures),
+    Tables = #tables{trie=A, dict=B},
+    Cover = lists:reverse(cover(Signatures)),
     build_index(Tables, Signatures, Cover),
     {sigtree, Tables}.
 
@@ -69,68 +71,58 @@ new(Signatures) ->
 %% we need to walk the text character by characters until we hit
 %% a match in our ETS ordered set.
 %% @end
-match(String, {sigtree, Tables}) ->
-    walk_text(Tables, String, String).
+match(Text, {sigtree, Tables}) ->
+    walk_text(Tables, Text, Text).
 
-walk_text(_, _, Substr) when length(Substr) =< ?B ->
-    nomatch;
-walk_text(#tables{sigtree=TabId, dict=DictId} = Tables, Sig, [_|T] = Substr) ->
-    [Chars, Beta] = split(Substr, ?B, ?BETA),
-    TrieIndex = list_to_int(Chars),
+walk_text(_, _, Substr) when length(Substr) =< ?B -> nomatch;
+walk_text(#tables{trie=TrieId, dict=DictId} = Tables, Text, [_|T] = Substr) ->
+    [B, Beta] = split(Substr, ?B, ?BETA),
+    TrieIndex = B,
     DictIndex = string:substr(Substr, 1, ?B + ?BETA),
 
-    case ets:lookup(TabId, TrieIndex) of
+    case ets:lookup(TrieId, TrieIndex) of
         [{TrieIndex, Leaf}] ->
-            case in_leaf(DictId, DictIndex, Leaf, Sig, Beta) of
-                true ->
-                    match;
-                false ->
-                    walk_text(Tables, Sig, T)
+            case check_leaf(DictId, DictIndex, Leaf, Text, Beta) of
+                true -> match;
+                false -> walk_text(Tables, Text, T)
             end;
         [] ->
-            walk_text(Tables, Sig, T)
+            walk_text(Tables, Text, T)
     end.
 
-in_leaf(DictId, DictIndex, Leaf, Sig, Beta) ->
+check_leaf(DictId, DictIndex, Leaf, Text, Beta) ->
     Matches = Leaf#leaf_node.matches,
-    Bloomfilter = Leaf#leaf_node.bloom,
-    InMatches = lists:any(fun(SubStr) -> is_prefix(SubStr, Beta) end, Matches),
-    InBloom = case Bloomfilter of
-        undefined -> false;
-        _ -> bloom:is_element(Beta, Bloomfilter)
-    end,
-    InMatches orelse (InBloom andalso dict_match(DictId, DictIndex, Sig)).
+    BF = Leaf#leaf_node.bloom,
+    InMatches = lists:any(fun ([]) -> true; % the index matched the string
+                              (SubStr) -> is_prefix(SubStr, Beta)
+                          end, Matches),
+    InMatches orelse (in_bloom(Beta, BF) andalso in_dict(DictId, DictIndex, Text)).
 
-dict_match(DictId, DictIndex, Sig) ->
+in_bloom(_, undefined) -> false;
+in_bloom(E, BF) -> bloom:is_element(E, BF).
+
+in_dict(DictId, DictIndex, Text) ->
     case ets:lookup(DictId, DictIndex) of
         [] ->
             false;
         [{DictIndex, Matches}] ->
-            lists:any(
-                fun(Pattern) -> 
-                    re:run(Sig, Pattern) =/= nomatch
-                end, Matches
-            )
+            lists:any(fun(Pattern) -> re:run(Text, Pattern) =/= nomatch end, Matches)
     end.
 
-is_prefix([], _) ->
-    true; % empty array means the trie index is a match
 is_prefix(SubStr, RS) ->
     string:str(RS, SubStr) == 1.
 
-build_index(_, [], _) ->
-    ok;
+build_index(_, [], _) -> ok;
 build_index(Tables, [Sig|T], Cover) ->
     case walk_bgrams(Tables, Sig, Cover) of
-        {match, Substring} -> add_index(Tables, Sig, binary_to_list(Substring));
+        {match, Substring} -> add_index(Tables, Sig, ?b2l(Substring));
         nomatch -> add_index(Tables, Sig, Sig)
     end,
     build_index(Tables, T, Cover). 
 
-walk_bgrams(_, _, []) ->
-    nomatch;
+walk_bgrams(_, _, []) -> nomatch;
 walk_bgrams(Tables, Sig, [BGram | T]) ->
-    case representative_substring(list_to_binary(Sig), BGram) of
+    case representative_substring(?l2b(Sig), ?l2b(BGram)) of
         {match, Substring} ->
             {match, Substring};
         nomatch ->
@@ -148,7 +140,7 @@ walk_bgrams(Tables, Sig, [BGram | T]) ->
 %% matches in a linked list.
 %% @end
 add_index(Tables, Signature, Substring) ->
-    add_sigtree_index(Tables#tables.sigtree, Substring),
+    add_trie_index(Tables#tables.trie, Substring),
     add_dict_index(Tables#tables.dict, Signature, Substring).
 
 add_dict_index(TabId, Sig, Substring) ->
@@ -161,13 +153,12 @@ add_dict_index(TabId, Sig, Substring) ->
             ets:insert(TabId, {Index, [Sig|Matches]})
     end.
 
-add_sigtree_index(TabId, Substring) ->
-    [Chars, Rest] = split(Substring, ?B, ?BETA),
-    Index = list_to_int(Chars),
+add_trie_index(TabId, Substring) ->
+    [TrieIndex, Rest] = split(Substring, ?B, ?BETA),
 
-    case ets:lookup(TabId, Index) of
+    case ets:lookup(TabId, TrieIndex) of
         [] ->
-            ets_insert(TabId, #leaf_node{}, Index, Rest);
+            ets_insert(TabId, #leaf_node{}, TrieIndex, Rest);
         [{Index, Leaf}] ->
             ets_insert(TabId, Leaf, Index, Rest)
     end.
@@ -199,27 +190,15 @@ ets_insert(TabId, Leaf0, Index, SubStr) ->
 cover(Signatures) ->
     lists:reverse(cover(Signatures, [])).
 cover(Signatures0, Acc) ->
-    TabId = cover_setup(),
-
-    build(TabId, Signatures0),
+    TabId = ets:new(frequency_table, [set]),
+    build_cover(TabId, Signatures0),
     BGram = highest_occurrence(TabId),
-
-    cover_cleanup(TabId),
+    ets:delete(TabId),
 
     case BGram of
-        undefined ->
-            Acc;
-        _ ->
-            Pruned = prune(Signatures0, BGram),
-            cover(Pruned, [BGram| Acc])
+        undefined -> Acc;
+        _ -> cover(prune(Signatures0, BGram), [BGram| Acc])
     end.
-
-cover_setup() ->
-    TabId = ets:new(frequency_table, [set]),
-    [ets:insert(TabId, {I, 0}) || I <- lists:seq(1, ?BGRAM_TABLE_SIZE)],
-    TabId.
-cover_cleanup(TabId) ->
-    true = ets:delete(TabId).
 
 %%%
 %% @private
@@ -232,7 +211,7 @@ prune(SigSet, BGram) ->
 prune([], Pruned, _) ->
     Pruned;
 prune([Sig|T], Pruned, BGram) ->
-    case representative_substring(list_to_binary(Sig), BGram) of
+    case representative_substring(?l2b(Sig), ?l2b(BGram)) of
         {match, _} ->
             % discard the signature if it is a representative
             % substring. These are (b + Beta) bytes long
@@ -282,30 +261,27 @@ highest_occurrence(TabId) ->
         ets:tab2list(TabId)
     ),
     case Size of
-        0 -> undefined;
-        _ -> int_to_bin(BGram)
+        -1 -> undefined;
+        _ -> BGram
     end.
 
-build(TabId, Signatures) ->
-    build(1, TabId, Signatures).
-build(_Pos, _TabId, []) ->
+build_cover(TabId, Signatures) ->
+    build_cover(1, TabId, Signatures).
+build_cover(_Pos, _TabId, []) ->
     ok;
-build(Pos, TabId, [Sig | Rest]) ->
-    left_to_right_pass(Pos, Sig, TabId),
-    build(Pos + 1, TabId, Rest).
+build_cover(Pos, TabId, [Sig | Rest]) ->
+    extract_covers_from_string(Sig, TabId),
+    build_cover(Pos + 1, TabId, Rest).
 
-left_to_right_pass(_Pos, Str, _TabId) when length(Str) < (?B + ?BETA) ->
+extract_covers_from_string(Str, _TabId) when length(Str) < (?B + ?BETA) ->
     ok;
-left_to_right_pass(Pos, [_|T] = Str, TabId) ->
-    [Chars, _] = split(Str, ?B, ?BETA),
-    Index = list_to_int(Chars),
-    ets:update_counter(TabId, Index, 1),
-    left_to_right_pass(Pos, T, TabId).
-
-list_to_int(List) ->
-    binary:decode_unsigned(list_to_binary(List)).
-int_to_bin(Bin) ->
-    binary:encode_unsigned(Bin).
+extract_covers_from_string([_|T] = Str, TabId) ->
+    [Index, _] = split(Str, ?B, ?BETA),
+    case catch ets:update_counter(TabId, Index, 1) of
+        X when is_number(X) -> ok;
+        _ -> ets:insert(TabId, {Index, 1})
+    end,
+    extract_covers_from_string(T, TabId).
 
 -ifndef(TEST).
 -include_lib("eunit/include/eunit.hrl").
