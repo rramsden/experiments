@@ -59,7 +59,8 @@
 %% @end
 new(Patterns) ->
     Signatures = lists:map(fun(P) -> 
-        #signature{pattern=P, chomped=regex_chomp(P)}
+        {ok, RE} = re:compile(P),
+        #signature{pattern=RE, chomped=regex_chomp(P)}
     end, Patterns),
     Cover = cover(Signatures),
     Tables0 = build_index(#tables{}, Signatures, Cover),
