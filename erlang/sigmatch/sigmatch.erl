@@ -97,10 +97,9 @@ walk_text(#tables{trie=Trie, dict=Dict} = Tables, Text, [_|T] = Substr) ->
 
     case dict:find(TrieIndex, Trie) of
         {ok, #leaf{matches=Matches, bloom=C}} ->
-            Bloom = uncompress(C),
             InMatches = re_match_any(Text, Matches),
             DictIndex = string:substr(Substr, 1, ?B + ?BETA),
-            case (InMatches orelse (in_bloom(Beta, Bloom) andalso in_dict(Dict, DictIndex, Text))) of
+            case (InMatches orelse (in_bloom(Beta, C) andalso in_dict(Dict, DictIndex, Text))) of
                 true -> match;
                 false -> walk_text(Tables, Text, T)
             end;
@@ -108,9 +107,13 @@ walk_text(#tables{trie=Trie, dict=Dict} = Tables, Text, [_|T] = Substr) ->
             walk_text(Tables, Text, T)
     end.
 
-in_bloom(_, undefined) ->
+in_bloom(Value, C) ->
+    Bloom = uncompress(C),
+    check_bloom(Value, Bloom).
+
+check_bloom(_, undefined) ->
     false;
-in_bloom(Value, BF) ->
+check_bloom(Value, BF) ->
     bloom:is_element(Value, BF).
 
 in_dict(Dict, DictIndex, Text) ->
