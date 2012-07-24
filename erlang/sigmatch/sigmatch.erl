@@ -51,12 +51,17 @@
 -define(ALPHABET, 256).
 -define(BGRAM_TABLE_SIZE, (?ALPHABET * ?ALPHABET)).
 
+% types
+-type sigtree() :: {sigtree, #tables{}}.
+
 %%%
 %% @doc
 %% new/1
 %%
 %% Generates a sigtree for a list of patterns
 %% @end
+-spec new(list(string())) -> sigtree().
+
 new(Patterns) ->
     Signatures = lists:map(fun(P) -> 
         {ok, RE} = re:compile(P),
@@ -87,8 +92,13 @@ compress_tree(#tables{dict=Dict0, trie=Trie0} = Tables) ->
 %% a match. Once we hit a match we check the leafs bloomfilter to
 %% see if its in the set. If it is use a lookup dict for possible matches
 %% @end
+-spec match(string(), sigtree()) -> match | nomatch.
+
 match(Text, {sigtree, Tables}) ->
     walk_text(Tables, Text, Text).
+
+%%%
+%% MATCHING
 
 walk_text(_, _, Substr) when length(Substr) =< ?B -> nomatch;
 walk_text(#tables{trie=Trie, dict=Dict} = Tables, Text, [_|T] = Substr) ->
