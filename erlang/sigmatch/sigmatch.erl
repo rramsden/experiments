@@ -23,14 +23,10 @@
 -module(sigmatch).
 -export([new/1, match/2]).
 
--define(l2b(X), list_to_binary(X)).
--define(b2l(X), binary_to_list(X)).
--define(t2b(X), term_to_binary(X)).
--define(b2t(X), binary_to_term(X)).
 
 -record(signature, {
-    pattern, % re
-    chomped 
+    pattern :: string(), % regex string
+    chomped :: string()
 }).
 
 -record(leaf, {
@@ -42,6 +38,14 @@
     trie = dict:new() :: dict:dict(any(), #leaf{}),
     dict = dict:new() :: dict:dict(any(), [string()])
 }).
+
+%%%
+%% MACROS
+%%
+-define(l2b(X), list_to_binary(X)).
+-define(b2l(X), binary_to_list(X)).
+-define(t2b(X), term_to_binary(X)).
+-define(b2t(X), binary_to_term(X)).
 
 % tuning parameters for sigtree
 -define(B, 2). % # of characters for trie index
@@ -71,17 +75,6 @@ new(Patterns) ->
     Tables0 = build_index(#tables{}, Signatures, Cover),
     Tables1 = compress_tree(Tables0),
     {sigtree, Tables1}.
-
-compress_tree(#tables{dict=Dict0, trie=Trie0} = Tables) ->
-    Dict1 = dict:map(fun(_, Patterns) -> compress(Patterns) end, Dict0),
-    Trie1 = dict:map(
-            % bloomfilters are fat, compress them down
-            fun(_, #leaf{bloom=B0} = Leaf) -> 
-                    B1 = compress(B0),
-                    Leaf#leaf{bloom=B1}
-            end, Trie0
-    ),
-    Tables#tables{dict=Dict1, trie=Trie1}.
 
 %%%
 %% @doc
@@ -143,6 +136,10 @@ compress(Leaf) ->
 uncompress(Leaf) ->
     ?b2t(zlib:uncompress(Leaf)).
 
+
+%%%
+%% PRE-PROCESSING
+
 build_index(Tables, [], _) -> Tables;
 build_index(Tables0, [Sig|T], Cover) ->
     Tables1 = case walk_bgrams(Tables0, Sig, Cover) of
@@ -201,6 +198,21 @@ add_trie_index(Trie, TrieIndex, _, Rest) ->
             Leaf#leaf{bloom = bloom:add_element(Rest, BF1)}
     end,
     dict:store(TrieIndex, BFNew, Trie).
+
+compress_tree(#tables{dict=Dict0, trie=Trie0} = Tables) ->
+    Dict1 = dict:map(fun(_, Patterns) -> compress(Patterns) end, Dict0),
+    Trie1 = dict:map(
+            % bloomfilters are fat, compress them down
+            fun(_, #leaf{bloom=B0} = Leaf) -> 
+                    B1 = compress(B0),
+                    Leaf#leaf{bloom=B1}
+            end, Trie0
+    ),
+    Tables#tables{dict=Dict1, trie=Trie1}.
+
+
+%%%
+%% COVER GENERATION
 
 %%%
 %% @private
@@ -271,10 +283,8 @@ highest_occurrence(TabId) ->
     {BGram, Size} = lists:foldl(
         fun({Index, Size}, {IndexOld, Max}) ->
                 case Size > Max of
-                    true ->
-                        {Index, Size};
-                    false ->
-                        {IndexOld, Max}
+                    true -> {Index, Size};
+                    false -> {IndexOld, Max}
                 end
         end,
         {-1, -1},
@@ -304,9 +314,9 @@ extract_covers_from_string([_|T] = Str, TabId) ->
     extract_covers_from_string(T, TabId).
 
 regex_chomp(Pattern0) ->
-    Pattern1 = re:replace(Pattern0, "[\\^\\$\\|\\?\\*\\+\\(\\)]+", "", [global, {return, list}]),
-    Pattern2 = re:replace(Pattern1, "\\\\[a-zA-Z]", "", [global, {return, list}]),
-    re:replace(Pattern2, "\\\\.", ".", [global, {return, list}]).
+    Regex = "\\\\[a-zA-Z]|\\.\\*|\\.\\+|[\\^\\$\\|\\?\\*\\+\\(\\)]+",
+    Pattern1 = re:replace(Pattern0, Regex, "", [global, {return, list}]),
+    re:replace(Pattern1, "\\\\.", ".", [global, {return, list}]).
 
 split(Str, _, _) when length(Str) =< ?B ->
     [Str, []];
@@ -325,7 +335,8 @@ small_pattern_test() ->
         "cow",
         "dog",
         "i ",
-        "xl van"
+        "xl van",
+        "^192\\.168.*$"
     ],
     S = sigmatch:new(Patterns),
     ?assertEqual(match, sigmatch:match("there is a cat in the bag", S)),
@@ -338,18 +349,21 @@ small_pattern_test() ->
     ?assertEqual(match, sigmatch:match("foo i bar", S)),
     ?assertEqual(match, sigmatch:match("xl vanz", S)),
     ?assertEqual(nomatch, sigmatch:match("foobar", S)),
+    ?assertEqual(match, sigmatch:match("192.168.10.10", S)),
+    ?assertEqual(nomatch, sigmatch:match("192.167.10.10", S)),
     ?assertEqual(nomatch, sigmatch:match("the lazy foo jumped over the moon", S)).
+
 
 regex_chomp_test() ->
     Patterns = [
         "^exact match$",
         "\\bboundary match\\b",
-        "^255\\.255\\.255\\.*$"
+        "^255\\.255\\.255.*$"
     ],
     Expected = [
         "exact match",
         "boundary match",
-        "255.255.255."
+        "255.255.255"
     ],
     ?assertEqual(lists:map(fun(P) -> regex_chomp(P) end, Patterns), Expected).
 
