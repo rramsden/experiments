@@ -111,7 +111,7 @@ handle_call({adjust, Q1}, _From, #state{demand=Demand, supply=Supply, links=Link
 
     % we need to truncate our floating point number here
     % otherwise will start getting some pretty big numbers in memory
-    TakeAway = trunc_float(Multiplier * Demand),
+    TakeAway = trunc_float(Multiplier * Supply),
 
     {reply, {ok, TakeAway}, State#state{supply=Supply-TakeAway}};
 
